@@ -19,6 +19,7 @@ require 'uri'
 require 'zlib'
 require 'newrelic-fluentd-output/version'
 require 'yajl'
+require 'connection_pool'
 
 module Fluent
   module Plugin
@@ -30,6 +31,10 @@ module Fluent
 
       config_param :api_key, :string, :default => nil
       config_param :base_uri, :string, :default => "https://log-api.newrelic.com/log/v1"
+      config_param :api_port, :integer, :default => 443
+      config_param :api_use_ssl, :bool, :default => true
+      config_param :conn_pool_size, :integer, :default => 5
+      config_param :conn_pool_timeout, :integer, :default => 5
       config_param :license_key, :string, :default => nil
 
       DEFAULT_BUFFER_TYPE = 'memory'.freeze
@@ -47,10 +52,20 @@ module Fluent
         true
       end
 
+      def new_client()
+        http = Net::HTTP.new(@end_point.host, @api_port)
+        http.use_ssl = @api_use_ssl
+        if @api_use_ssl
+          http.verify_mode = OpenSSL::SSL::VERIFY_PEER
+        end
+
+        http
+      end
+
       def configure(conf)
         super
         if @api_key.nil? && @license_key.nil?
-          raise Fluent::ConfigError.new("'api_key' or 'license_key' parameter is required") 
+          raise Fluent::ConfigError.new("'api_key' or 'license_key' parameter is required")
         end
 
         # create initial sockets hash and socket based on config param
@@ -64,6 +79,9 @@ module Fluent
             'Content-Encoding' => 'gzip'
         }.merge(auth)
         .freeze
+
+        @conn_pool = ConnectionPool.new(size: @conn_pool_size,
+                                        timeout: @conn_pool_timeout) { new_client }
       end
 
       def package_record(record, timestamp)
@@ -89,7 +107,7 @@ module Fluent
           packaged['message'] = record['log']
           packaged['attributes'].delete('log')
         end
-        
+
         packaged
       end
 
@@ -121,7 +139,7 @@ module Fluent
         gzip.close
         send_payload(io.string)
       end
-      
+
       def handle_response(response)
         if !(200 <= response.code.to_i && response.code.to_i < 300)
           log.error("Response was " + response.code + " " + response.body)
@@ -129,12 +147,11 @@ module Fluent
       end
 
       def send_payload(payload)
-        http = Net::HTTP.new(@end_point.host, 443)
-        http.use_ssl = true
-        http.verify_mode = OpenSSL::SSL::VERIFY_PEER
         request = Net::HTTP::Post.new(@end_point.request_uri, @header)
         request.body = payload
-        handle_response(http.request(request))
+        @conn_pool.with do |conn|
+          handle_response(conn.request(request))
+        end
       end
 
     end
